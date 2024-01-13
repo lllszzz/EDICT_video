@@ -18,14 +18,16 @@ import sys
 import os
 from torchvision import datasets
 import pickle
+import glob
 
 # StableDiffusion P2P implementation originally from https://github.com/bloc97/CrossAttentionControl
 
 # Have diffusers with hardcoded double-casting instead of float
-from my_diffusers import AutoencoderKL, UNet2DConditionModel
+from my_diffusers import AutoencoderKL, UNet2DConditionModel,UNetPseudo3DConditionModel
 from my_diffusers.schedulers.scheduling_utils import SchedulerOutput
 from my_diffusers import LMSDiscreteScheduler, PNDMScheduler, DDPMScheduler, DDIMScheduler
 
+# from diffusers import UNet3DConditionModel
 
 import random
 from tqdm.auto import tqdm
@@ -33,7 +35,7 @@ from torch import autocast
 from difflib import SequenceMatcher
 
 # Build our CLIP model
-model_path_clip = "openai/clip-vit-large-patch14"
+model_path_clip = "/home/lvsizhe/openai/clip-vit-large-patch14"
 clip_tokenizer = CLIPTokenizer.from_pretrained(model_path_clip)
 clip_model = CLIPModel.from_pretrained(model_path_clip, torch_dtype=torch.float16)
 clip = clip_model.text_model
@@ -42,10 +44,11 @@ clip = clip_model.text_model
 # Getting our HF Auth token
 with open('hf_auth', 'r') as f:
     auth_token = f.readlines()[0].strip()
-model_path_diffusion = "CompVis/stable-diffusion-v1-4"
+model_path_diffusion = "/home/lvsizhe/CompVis/stable-diffusion-v1-4"
 # Build our SD model
-unet = UNet2DConditionModel.from_pretrained(model_path_diffusion, subfolder="unet", use_auth_token=auth_token, revision="fp16", torch_dtype=torch.float16)
-vae = AutoencoderKL.from_pretrained(model_path_diffusion, subfolder="vae", use_auth_token=auth_token, revision="fp16", torch_dtype=torch.float16)
+# unet = UNet2DConditionModel.from_pretrained(model_path_diffusion, subfolder="unet", use_auth_token=auth_token, revision="fp16", torch_dtype=torch.float16)
+unet = UNetPseudo3DConditionModel.from_2d_model(os.path.join(model_path_diffusion, "unet"))
+vae = AutoencoderKL.from_pretrained(model_path_diffusion, subfolder="vae", revision="fp16", torch_dtype=torch.float16)
 
 # Push to devices w/ double precision
 device = 'cuda'
@@ -54,6 +57,7 @@ vae.double().to(device)
 clip.double().to(device)
 print("Loaded all models")
 
+frame = 4
     
 def EDICT_editing(im_path,
                   base_prompt,
@@ -94,6 +98,11 @@ def EDICT_editing(im_path,
     """
     # Resize/center crop to 512x512 (Can do higher res. if desired)
     orig_im = load_im_into_format_from_path(im_path) if isinstance(im_path, str) else im_path # trust OK
+    sample_rate = 8//frame
+    orig_im1 = []
+    for i in range(frame):
+        orig_im1.append(orig_im[2*i])
+    orig_im = orig_im1
     
     # compute latent pair (second one will be original latent if run_baseline=True)
     latents = coupled_stablediffusion(base_prompt,
@@ -203,7 +212,17 @@ def center_crop(im):
 
 
 def load_im_into_format_from_path(im_path):
-    return center_crop(Image.open(im_path)).resize((512,512))
+    image_files = sorted([f for f in os.listdir(im_path) if f.endswith('.png')])
+    images = []
+    for image_file in image_files:
+        file_path = os.path.join(im_path, image_file)
+        # print(file_path)
+        images.append(center_crop(Image.open(file_path)).resize((512,512)))
+
+    return images
+
+# def load_im_into_format_from_path(im_path):
+#     return center_crop(Image.open(im_path)).resize((512,512))
 
 
 #### P2P STUFF #### 
@@ -761,17 +780,35 @@ def coupled_stablediffusion(prompt="",
     height = height - height % 64
     
     
-    #Preprocess image if it exists (img2img)
+    # #Preprocess image if it exists (img2img)
+    # if init_image is not None:
+    #     assert reverse # want to be performing deterministic noising 
+    #     # can take either pair (output of generative process) or single image
+    #     if isinstance(init_image, list):
+    #         if isinstance(init_image[0], torch.Tensor):
+    #             init_latent = [t.clone() for t in init_image]
+    #         else:
+    #             init_latent = [image_to_latent(im) for im in init_image]
+    #     else:
+    #         init_latent = image_to_latent(init_image)
+    #     # this is t_start for forward, t_end for reverse
+    #     t_limit = steps - int(steps * init_image_strength)
+    # else:
+    #     assert not reverse, 'Need image to reverse from'
+    #     init_latent = torch.zeros((1, unet.in_channels, height // 8, width // 8), device=device)
+    #     t_limit = 0
+
+    #Preprocess image if it exists (video2video)
     if init_image is not None:
         assert reverse # want to be performing deterministic noising 
         # can take either pair (output of generative process) or single image
         if isinstance(init_image, list):
             if isinstance(init_image[0], torch.Tensor):
                 init_latent = [t.clone() for t in init_image]
+                init_latent = torch.cat(init_latent, dim=0)
             else:
                 init_latent = [image_to_latent(im) for im in init_image]
-        else:
-            init_latent = image_to_latent(init_image)
+                init_latent = torch.cat(init_latent, dim=0)
         # this is t_start for forward, t_end for reverse
         t_limit = steps - int(steps * init_image_strength)
     else:
@@ -844,8 +881,8 @@ def coupled_stablediffusion(prompt="",
 
         init_attention_edit(tokens_conditional, tokens_conditional_edit)
 
-    init_attention_func()
-    init_attention_weights(prompt_edit_token_weights)
+    # init_attention_func()
+    # init_attention_weights(prompt_edit_token_weights)
 
     timesteps = schedulers[0].timesteps[t_limit:]
     if reverse: timesteps = timesteps.flip(0)
@@ -942,17 +979,38 @@ def coupled_stablediffusion(prompt="",
         results = [latent_pair]
         return results if len(results)>1 else results[0]
     
+    # # decode latents to iamges
+    # images = []
+    # for latent_i in range(2):
+    #     latent = latent_pair[latent_i] / 0.18215
+    #     print(latent.shape)
+    #     image = vae.decode(latent.to(vae.dtype)).sample
+    #     images.append(image)
+
+    # # Return images
+    # return_arr = []
+    # for image in images:
+    #     image = prep_image_for_return(image)
+    #     return_arr.append(image)
+    # results = [return_arr]
+    # return results if len(results)>1 else results[0]
+
     # decode latents to iamges
     images = []
     for latent_i in range(2):
         latent = latent_pair[latent_i] / 0.18215
-        image = vae.decode(latent.to(vae.dtype)).sample
+        image = []
+        # print(latent[0].shape)
+        for i in range(frame):
+            image.append(vae.decode(latent[i].unsqueeze(0).to(vae.dtype)).sample)
         images.append(image)
 
     # Return images
     return_arr = []
-    for image in images:
-        image = prep_image_for_return(image)
+    for latent_i in range(2):
+        image = []
+        for i in range(frame):
+            image.append(prep_image_for_return(images[latent_i][i]))
         return_arr.append(image)
     results = [return_arr]
     return results if len(results)>1 else results[0]
